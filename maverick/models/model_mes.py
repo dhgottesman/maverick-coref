@@ -8,6 +8,7 @@ from transformers import AutoModel, AutoConfig
 
 from maverick.common.util import *
 from maverick.common.constants import *
+from flashdeberta import FlashDebertaV2Model
 
 
 class Maverick_mes(torch.nn.Module):
@@ -15,7 +16,12 @@ class Maverick_mes(torch.nn.Module):
         super().__init__()
         # document transformer encoder
         self.encoder_hf_model_name = kwargs["huggingface_model_name"]
-        self.encoder = AutoModel.from_pretrained(self.encoder_hf_model_name)
+        print(args)
+        print(kwargs)
+        if "flash" in kwargs and kwargs["flash"]:
+            self.encoder = FlashDebertaV2Model.from_pretrained(self.encoder_hf_model_name)
+        else:
+            self.encoder = AutoModel.from_pretrained(self.encoder_hf_model_name)
         self.encoder_config = AutoConfig.from_pretrained(self.encoder_hf_model_name)
         self.encoder.resize_token_embeddings(self.encoder.embeddings.word_embeddings.num_embeddings + 3)
 

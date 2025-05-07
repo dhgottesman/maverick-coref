@@ -10,15 +10,18 @@ from maverick.models import *
 
 from transformers.utils.hub import cached_file as hf_cached_file
 
-
 class Maverick:
     # put the pip package online
-    def __init__(self, hf_name_or_path="sapienzanlp/maverick-mes-ontonotes", device="cuda"):
+    def __init__(self, hf_name_or_path="sapienzanlp/maverick-mes-ontonotes", device="cuda", flash=True):
         self.device = device
         path = self.__get_model_path__(hf_name_or_path)
-        self.model = BasePLModule.load_from_checkpoint(path, _recursive_=False, map_location=self.device)
+        self.model = BasePLModule.load_from_checkpoint(path, _recursive_=False, map_location=self.device, flash=flash)
         self.model = self.model.eval()
         self.model = self.model.model
+        print(self.model.encoder.encoder.layer[0].attention.self) 
+        print(self.model.encoder)
+        print(self.model.encoder.encoder)
+
         self.tokenizer = self.__get_model_tokenizer__()
 
     def __get_model_path__(self, hf_name_or_path):
@@ -46,18 +49,33 @@ class Maverick:
         return result
 
     def preprocess(self, sample, speakers=None):
+        from nltk.tokenize import load
+        tokenizer = load("tokenizers/punkt/english.pickle")
+
         type = self.__sample_type__(sample)
         char_offsets = None
         if type == "text":
             nlp = download_load_spacy()
             char_offsets = []
             sentences = []
-            off = 0
-            s = sent_tokenize(sample)
-            for sent, sentence in zip(nlp.pipe(s), s):
-                char_offsets.append([(off + tok.idx, off + tok.idx + len(tok.text) - 1) for tok in sent])
+
+            # Get sentence spans directly from the original text to preserve whitespace
+            sentence_spans = list(tokenizer.span_tokenize(sample))
+
+            # Iterate over spans and pipe original sentences into spaCy
+            for start, end in sentence_spans:
+                s = sample[start:end]
+                sent = next(nlp.pipe([s]))  # spaCy doc for this sentence
+   
+                # Align token character offsets to the full text using the sentence start
+                char_offsets.append([(start + tok.idx, start + tok.idx + len(tok.text) - 1) for tok in sent])
                 sentences.append([tok.text for tok in sent])
-                off += len(sentence) + 1
+
+            # Check that the tokenization is correct
+            for i, (sentence, sentences_offsets) in enumerate(zip(sentences, char_offsets)):
+                for tok, (start, end) in zip(sentence, sentences_offsets):
+                    assert(tok == sample[start:end+1])
+
             char_offsets = flatten(char_offsets)
             tokens = flatten(sentences)
             eos_len = [len(value) for value in sentences]
@@ -97,11 +115,14 @@ class Maverick:
         tokens, eos_indices, speakers, char_offsets = self.preprocess(sample, speakers)  # [[w1,w2,w3...], []]
         tokenized = self.tokenize(tokens, eos_indices, speakers, predefined_mentions, add_gold_clusters)
 
+        # Automatically detect model device
+        device = next(self.model.parameters()).device
+
         output = self.model(
             stage="test",
-            input_ids=torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(self.device),
-            attention_mask=torch.tensor(tokenized["attention_mask"]).unsqueeze(0).to(self.device),
-            eos_mask=torch.tensor(tokenized["eos_mask"]).unsqueeze(0).to(self.device),
+            input_ids=torch.tensor(tokenized["input_ids"]).unsqueeze(0).to(device),
+            attention_mask=torch.tensor(tokenized["attention_mask"]).unsqueeze(0).to(device),
+            eos_mask=torch.tensor(tokenized["eos_mask"]).unsqueeze(0).to(device),
             tokens=[tokenized["tokens"]],
             subtoken_map=[tokenized["subtoken_map"]],
             new_token_map=[tokenized["new_token_map"]],
@@ -117,7 +138,7 @@ class Maverick:
                     )
                 )
                 .unsqueeze(0)
-                .to(self.device)
+                .to(device)
             ),
         )
 
@@ -134,15 +155,16 @@ class Maverick:
             [" ".join(tokens[span[0] : span[1] + 1]) for span in cluster] for cluster in clusters_predicted
         ]
         result["clusters_char_text"] = None
-        if char_offsets != None:
+        # Changed this so that "clusters_char_offsets" indices are not inclusive (i.e. [start, end) instead of [start, end]).
+        if char_offsets is not None:
             result["clusters_char_offsets"] = [
-                [(char_offsets[span[0]][0], char_offsets[span[1]][1]) for span in cluster] for cluster in clusters_predicted
+                [(char_offsets[span[0]][0], char_offsets[span[1]][1] + 1) for span in cluster] for cluster in clusters_predicted
             ]
 
-            # result["clusters_char_text"] = [
-            #     [sample[char_offsets[span[0]][0] : char_offsets[span[1]][1] + 1] for span in cluster]
-            #     for cluster in clusters_predicted
-            # ]
+            result["clusters_char_text"] = [
+                [sample[char_offsets[span[0]][0] : char_offsets[span[1]][1] + 1] for span in cluster]
+                for cluster in clusters_predicted
+            ]
 
         return result
 
