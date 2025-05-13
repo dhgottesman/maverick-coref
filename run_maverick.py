@@ -237,7 +237,6 @@ class WorkerPoolManager:
                     print(f"[Manager] Logging failed line {res_idx} (only 1 live worker)", flush=True)
 
                 print(f"[Manager] Error at line {res_idx} from PID {pid}. Exiting.", flush=True)
-                self.shutdown()
                 raise SystemExit(f"[Fatal Error] {res_idx} — shutting down.")
 
         except queue.Empty:
@@ -307,9 +306,9 @@ if __name__ == "__main__":
             pool.process_loop(INPUT_FILE, OUTPUT_FILE)
             break  # Done processing all input; exit loop
         except SystemExit as e:
-            print(f"[Main] Executor crashed with fatal error: {e}. Restarting pool...", flush=True)
+            print(f"[Main] Executor crashed with fatal error: {e}. hutting down and restarting pool...", flush=True)
         except Exception as e:
-            print(f"[Main] Unexpected exception: {e}. Restarting pool...", flush=True)
+            print(f"[Main] Unexpected exception: {e}. Shutting down and restarting pool...", flush=True)
         finally:
             pool.shutdown()
             time.sleep(5) # Avoid rapid restarts
