@@ -7,12 +7,14 @@ from multiprocessing import get_context, Process, Queue
 from collections import deque
 from maverick import Maverick
 import queue
+from tqdm import tqdm
 
 MAX_MEMORY_GB = 75
 SECTION_MEMORY_GB = 3
 
 REFINED_OUTPUT_DIR = "/home/morg/dataset/refined"
 OUTPUT_DIR = "/home/morg/dataset/maverick"
+FAILED_OUTPUT_FILE = None
 
 MAX_WORKERS = None
 MAX_PENDING = None
@@ -23,15 +25,37 @@ WORKER_IDLE_TIMEOUT = 60 * 20  # seconds
 def init_model():
     return Maverick(hf_name_or_path="sapienzanlp/maverick-mes-ontonotes", flash=True)
 
-def stream_ndjson(file_path, start):
-    with open(file_path, 'r') as f:
+def stream_ndjson(file_path, target_index=75):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        low, high = 0, f.seek(0, 2)  # Go to end to get file size
+        
+        # Binary search for line with target_index
+        while low < high:
+            mid = (low + high) // 2
+            f.seek(mid)
+            f.readline()  # Skip partial line
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            index = json.loads(line)['line_index']
+            if index is None:
+                high = mid  # Malformed line or end
+            elif index < target_index:
+                low = pos + 1
+            else:
+                high = mid
+        
+        # Stream from here
+        f.seek(low)
+        f.readline()  # Skip partial line
         for line in f:
-            line = json.loads(line)
-            i = line.get("line_index")
-            if i >= start:
-                yield (i, line)
+            record = json.loads(line)
+            i = record.get('line_index')
+            if i >= target_index:
+                yield (i, record)
 
-def get_start_index(input_path, output_path):
+def get_start_index(input_path, output_path, skip_indices):
     if not os.path.exists(output_path):
         with open(input_path, 'r') as f:
             return json.loads(f.readline()).get("line_index", 0)
@@ -43,7 +67,10 @@ def get_start_index(input_path, output_path):
         except OSError:
             f.seek(0)
         last_line = f.readline().decode()
-    return json.loads(last_line).get("line_index", -1) + 1
+    i = json.loads(last_line).get("line_index", -1) + 1
+    if i == max(skip_indices):
+        i += 1
+    return i
 
 def split_text(text, section_starts, max_chars=50000):
     section_starts = sorted(set(section_starts))
@@ -188,11 +215,11 @@ class WorkerPoolManager:
         try:
             status, res_idx, result, pid = self.result_queue.get(timeout=WORKER_IDLE_TIMEOUT)
             line, _ = pending_tasks[res_idx]
-
+            
             if status == "success":
                 self.success_log.append("success")
                 result_buffer[res_idx] = (line, result)
-
+                
                 while next_index in result_buffer:
                     _, output = result_buffer.pop(next_index)
                     f.write(json.dumps(output[1]) + "\n")
@@ -203,6 +230,12 @@ class WorkerPoolManager:
                 self.monitor_and_scale()
 
             elif status == "fail":
+                # Check how many workers are alive
+                live_workers = sum(1 for p in self.workers if p.is_alive())
+
+                if live_workers == 1:
+                    print(f"[Manager] Logging failed line {res_idx} (only 1 live worker)", flush=True)
+
                 print(f"[Manager] Error at line {res_idx} from PID {pid}. Exiting.", flush=True)
                 self.shutdown()
                 raise SystemExit(f"[Fatal Error] {res_idx} — shutting down.")
@@ -213,7 +246,19 @@ class WorkerPoolManager:
         return next_index
 
     def process_loop(self, input_path, output_path):
-        start_index = get_start_index(input_path, output_path)
+        print("[Manager] Starting process loop", flush=True)
+
+        skip_indices = set()
+        if os.path.exists(FAILED_OUTPUT_FILE):
+            with open(FAILED_OUTPUT_FILE, 'r') as f:
+                skip_indices = set()
+                for line in f:
+                    skip_indices.add(int(line.strip()))
+        print(f"SKIP INDICES: {skip_indices}", flush=True)
+
+        start_index = get_start_index(input_path, output_path, skip_indices)
+        print("[Manager] Starting from index", start_index, flush=True)
+        
         result_buffer = {}
         pending_tasks = {}
         next_index = start_index
@@ -243,7 +288,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     MAX_WORKERS = args.max_memory_gb // SECTION_MEMORY_GB
-    MAX_PENDING = MAX_WORKERS * 10
+    MAX_PENDING = MAX_WORKERS * 8
     SCALE_UP_THRESHOLD = MAX_WORKERS * 2
 
     print(f"Max memory: {args.max_memory_gb} GB", flush=True)
@@ -253,6 +298,7 @@ if __name__ == "__main__":
 
     INPUT_FILE = os.path.join(REFINED_OUTPUT_DIR, f"wikipedia_links_sections_{args.gpu_id}.json")
     OUTPUT_FILE = os.path.join(OUTPUT_DIR, f"maverick_{args.gpu_id}.json")
+    FAILED_OUTPUT_FILE = os.path.join(OUTPUT_DIR, f"maverick_fail_{args.gpu_id}.txt")
 
     while True:
         pool = WorkerPoolManager(max_workers=MAX_WORKERS)
