@@ -20,14 +20,18 @@ MAX_WORKERS = None
 MAX_PENDING = None
 SCALE_UP_THRESHOLD = None
 
-WORKER_IDLE_TIMEOUT = 60 * 20  # seconds
+WORKER_IDLE_TIMEOUT = 60 * 200  # seconds
 
 def init_model():
-    return Maverick(hf_name_or_path="sapienzanlp/maverick-mes-ontonotes", flash=True)
+    model = Maverick(hf_name_or_path="sapienzanlp/maverick-mes-ontonotes", flash=True)
+    print("[Worker]: After init model", flush=True)
+    return model
 
-def stream_ndjson(file_path, target_index=75):
+import json
+
+def stream_ndjson(file_path, target_index):
     with open(file_path, 'r', encoding='utf-8') as f:
-        low, high = 0, f.seek(0, 2)  # Go to end to get file size
+        low, high = 0, f.seek(0, 2)  # Move to end to get file size
         
         # Binary search for line with target_index
         while low < high:
@@ -38,22 +42,32 @@ def stream_ndjson(file_path, target_index=75):
             line = f.readline()
             if not line:
                 break
-            index = json.loads(line)['line_index']
+            try:
+                index = json.loads(line).get('line_index')
+            except (json.JSONDecodeError, KeyError):
+                high = mid
+                continue
+
             if index is None:
-                high = mid  # Malformed line or end
+                high = mid
             elif index < target_index:
                 low = pos + 1
             else:
                 high = mid
-        
-        # Stream from here
+
+        # Stream from the first complete line after or at `low`
         f.seek(low)
-        f.readline()  # Skip partial line
+        if low != 0:
+            f.readline()  # Skip partial line
+
         for line in f:
-            record = json.loads(line)
-            i = record.get('line_index')
-            if i >= target_index:
-                yield (i, record)
+            try:
+                record = json.loads(line)
+                i = record.get('line_index')
+                if i is not None and i >= target_index:
+                    yield (i, record)
+            except json.JSONDecodeError:
+                continue
 
 def get_start_index(input_path, output_path, skip_indices):
     if not os.path.exists(output_path):
@@ -68,7 +82,7 @@ def get_start_index(input_path, output_path, skip_indices):
             f.seek(0)
         last_line = f.readline().decode()
     i = json.loads(last_line).get("line_index", -1) + 1
-    if i == max(skip_indices):
+    if len(skip_indices) > 0 and i == max(skip_indices):
         i += 1
     return i
 
@@ -213,6 +227,7 @@ class WorkerPoolManager:
 
     def _process_next_result(self, pending_tasks, result_buffer, f, next_index):
         try:
+            print(next_index, flush=True)
             status, res_idx, result, pid = self.result_queue.get(timeout=WORKER_IDLE_TIMEOUT)
             line, _ = pending_tasks[res_idx]
             
@@ -267,7 +282,9 @@ class WorkerPoolManager:
             for idx, line in input_iter:
                 while len(pending_tasks) >= MAX_PENDING:
                     next_index = self._process_next_result(pending_tasks, result_buffer, f, next_index)
-
+                if idx == start_index:
+                    print(f"PUT ON TASK QUEUE {idx}")
+                    print(line)
                 self.task_queue.put((idx, line))
                 pending_tasks[idx] = (line, 0)
 

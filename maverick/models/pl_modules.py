@@ -19,11 +19,19 @@ class BasePLModule(pl.LightningModule):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
         self.save_hyperparameters()
+
+        # Ensure 'flash' is added to the model configuration if missing
+        if "flash" not in self.hparams.model:
+            self.hparams.model["flash"] = kwargs["flash"]  # Add the 'flash' argument with a default value
+
         try:
+            # Attempt to instantiate the model
             self.model = hydra.utils.instantiate(self.hparams.model)
-        except:
+        except Exception:
+            # Ensure '_target_' is properly prefixed and retry instantiation
             self.hparams.model["_target_"] = "maverick." + self.hparams.model["_target_"]
             self.model = hydra.utils.instantiate(self.hparams.model)
+        
         self.train_step_predictions = []
         self.train_step_gold = []
         self.validation_step_predictions = []
